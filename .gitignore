@@ -1,0 +1,59 @@
+# =========================
+# Node & React (Frontend)
+# =========================
+node_modules/
+dist/
+dist-ssr/
+build/
+*.local
+
+# Node Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# =========================
+# Rust & Tauri (Backend)
+# =========================
+# Ignore Cargo build directories (Tauri usually nests this in src-tauri)
+/src-tauri/target/
+target/
+# NOTE: Cargo.lock is intentionally NOT ignored because Tauri builds an executable binary.
+
+# Rust backups and debug files
+**/*.rs.bk
+*.pdb
+
+# =========================
+# VS Code / IDEs
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+.idea/
+.history/
+*.vsix
+*.sln
+*.suo
+*.ntvs*
+*.njsproj
+.ionide
+
+# =========================
+# OS / System Files
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
