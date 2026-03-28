@@ -1,1 +1,0 @@
-fetch("https://api.curseforge.com/v1/mods/search?gameId=432&classId=4471&pageSize=5", { headers: { "x-api-key": "$2a$10$AtM9xus5SkcWhRaqPEvRaOSIX91hTw0EvBJh1GgM9ZpSUTwM2KO8e", "Accept": "application/json" } }).then(async r => { console.log(r.status); console.log((await r.text()).substring(0, 100)); })
