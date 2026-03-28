@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import "./index.css";
 
 // Interface map matching our Rust UIInstance struct
@@ -26,7 +25,7 @@ function App() {
   const [instanceLoader, setInstanceLoader] = useState("Vanilla");
 
   // Discover Fetch State
-  const [discoverQuery, setDiscoverQuery] = useState("");
+  const [discoverQuery, setDiscoverQuery] = useState("optimization");
   const [discoverSort, setDiscoverSort] = useState("relevance");
   const [discoverProvider, setDiscoverProvider] = useState("Modrinth");
   const [modpacks, setModpacks] = useState<any[]>([]);
@@ -56,7 +55,7 @@ function App() {
 
   useEffect(() => {
     refreshInstances();
-    searchModpacks("", "relevance", discoverProvider); // Initial fetch
+    searchModpacks("optimization", "relevance", "Modrinth"); // Initial fetch
   }, []);
 
   const switchCategory = (category: string) => {
@@ -123,97 +122,60 @@ function App() {
     setIsSearching(true);
     try {
       if (provider === "Modrinth") {
-        const safeQuery = query.trim() ? query : "modpack";
-        const res = await fetch(`https://api.modrinth.com/v2/search?query=${safeQuery}&facets=[["project_type:modpack"]]&index=${sort}&limit=100`);
+        const res = await fetch(`https://api.modrinth.com/v2/search?query=${query}&facets=[["project_type:modpack"]]&index=${sort}&limit=12`);
         const data = await res.json();
         setModpacks(data.hits.map((hit: any) => ({
           id: hit.project_id,
           title: hit.title,
           author: hit.author,
           description: hit.description,
-          icon_url: hit.icon_url || "https://minotar.net/helm/Modrinth/100.png",
+          icon_url: hit.icon_url,
         })));
-      } else if (provider === "CurseForge") {
-          const safeQuery = query.trim() ? encodeURIComponent(query) : "";
-          const res = await tauriFetch(`https://api.curseforge.com/v1/mods/search?gameId=432&classId=4471&searchFilter=${safeQuery}&pageSize=50`, {
-            headers: { "x-api-key": import.meta.env.VITE_CURSEFORGE_API_KEY, "Accept": "application/json" }
-          });
-          if (!res.ok) {
-            const errorText = await res.text();
-            console.error(`CurseForge API rejected the key. Status: ${res.status}. Message: ${errorText}`);
-            setModpacks([]);
-            return;
-          }
+      } else if (provider === "ATLauncher") {
+          const res = await fetch(`https://api.atlauncher.com/v1/packs`);
           const data = await res.json();
-          setModpacks((data.data || []).map((pack: any) => ({
+          let packs = data.data || [];
+          if (query.trim()) {
+            packs = packs.filter((p: any) => p.name.toLowerCase().includes(query.toLowerCase()) || p.description?.toLowerCase().includes(query.toLowerCase()));
+          }
+          setModpacks(packs.slice(0, 12).map((pack: any) => ({
             id: pack.id.toString(),
             title: pack.name,
-            author: pack.authors?.[0]?.name || "Unknown",
-            description: pack.summary || "A CurseForge modpack.",
-            icon_url: pack.logo?.url || "https://minotar.net/helm/CurseForge/100.png",
+            author: pack.creators?.join(", ") || "Unknown",
+            description: pack.description || "An ATLauncher modpack.",
+            icon_url: "https://minotar.net/helm/ATLauncher/100.png",
           })));
-      } else if (provider === "ATLauncher") {
-          const res = await fetch(`https://download.nodecdn.net/containers/atl/launcher/json/packsnew.json`);
-          const data = await res.json();
-          let packs = data || [];
-          if (query.trim()) {
-            packs = packs.filter((p: any) => p.name?.toLowerCase().includes(query.toLowerCase()) || p.description?.toLowerCase().includes(query.toLowerCase()));
-          }
-          setModpacks(packs.map((pack: any) => {
-            const safeName = pack.name?.toLowerCase().replace(/[^a-z0-9]/g, "") || "";
-            return {
-              id: pack.id?.toString() || pack.name,
-              title: pack.name,
-              author: "ATLauncher Formatter",
-              description: pack.description || "An ATLauncher modpack.",
-              icon_url: `https://download.nodecdn.net/containers/atl/launcher/images/${safeName}.png`
-            }
-          }));
         } else if (provider === "Technic") {
-          // Their main search endpoint is down and CORS protected. 
-          // Using Solder API for base packs as fallback, via allorigins proxy to bypass Chromium CORS
-          const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent('https://solder.technicpack.net/api/modpack')}`);
+          const safeQuery = query.trim() ? encodeURIComponent(query) : "pack";
+          const res = await fetch(`https://api.technicpack.net/search?q=${safeQuery}&build=111`);
           const data = await res.json();
-          let packs = Object.entries(data.modpacks || {}).map(([slug, name]) => ({
-             slug, name: name as string
-          }));
-          if (query.trim()) {
-            packs = packs.filter(p => p.name.toLowerCase().includes(query.toLowerCase()));
-          }
-          setModpacks(packs.map((pack: any) => ({
-            id: pack.slug,
-            title: pack.name,
-            author: "Technic Platform",
-            description: `The official ${pack.name} modpack via Solder API.`,
-            // Technic's base CDN uses this specific format for their legacy/base Solder packs:
-            icon_url: `https://launcher.technicpack.net/assets/images/modpacks/${pack.slug}.png`
+          setModpacks((data.modpacks || []).slice(0, 12).map((pack: any) => ({
+            id: pack.name,
+            title: pack.displayName,
+            author: pack.author || "Unknown",
+            description: pack.description || "A Technic modpack.",
+            icon_url: pack.icon?.url || pack.icon || "",
           })));
         } else if (provider === "FTB") {
-          let urls: string[] = [];
-          if (query.trim()) {
-            const safeQuery = encodeURIComponent(query);
-            const res = await fetch(`https://api.modpacks.ch/public/modpack/search/100?term=${safeQuery}`);
-            const data = await res.json();
-            urls = (data.packs || []).map((id: number) => `https://api.modpacks.ch/public/modpack/${id}`);
-          } else {
-             // For FTB, getting 'all' modpacks gives us 90+ valid IDs directly
-            const resAll = await fetch(`https://api.modpacks.ch/public/modpack/all`);
-            const dataAll = await resAll.json();
-            urls = (dataAll.packs || []).map((id: number) => `https://api.modpacks.ch/public/modpack/${id}`);
-          }
-          
-          // Chunk requests to avoid hitting concurrent connection limits
-          const packInfos = await Promise.all(
-            urls.map(url => fetch(url).then(r => r.json()).catch(() => null))
-          );
-
-          setModpacks(packInfos.filter(p => p !== null && p.status === "success").map((pack: any) => ({
-            id: pack.id?.toString(),
+          const safeQuery = query.trim() ? encodeURIComponent(query) : "ftb";
+          const res = await fetch(`https://api.modpacks.ch/public/modpack/search/12?term=${safeQuery}`);
+          const data = await res.json();
+          setModpacks((data.packs || []).map((pack: any) => ({
+            id: pack.id.toString(),
             title: pack.name,
             author: pack.authors?.[0]?.name || "FTB Team",
-            description: pack.synopsis || pack.description || "An FTB modpack.",
-            icon_url: pack.art?.find((a: any) => a.type === "square")?.url || pack.art?.[0]?.url || "https://minotar.net/helm/FTB/100.png",
+            description: pack.synopsis || "An FTB modpack.",
+            icon_url: pack.art?.find((a: any) => a.type === "square")?.url || pack.art?.[0]?.url || "",
           })));
+        });
+        const data = await res.json();
+        setModpacks(data.data.map((mod: any) => ({
+          id: mod.id.toString(),
+          title: mod.name,
+          author: mod.authors[0]?.name || "Unknown",
+          description: mod.summary,
+          icon_url: mod.logo?.thumbnailUrl || "",
+        })));
       }
     } catch (e) {
       console.error(`${provider} fetch failed:`, e);
@@ -637,19 +599,19 @@ function App() {
                   <button onClick={() => searchModpacks(discoverQuery, discoverSort, discoverProvider)} className="bg-[#111827] text-white px-6 py-3.5 rounded-xl font-bold shadow-md hover:bg-[#1F2937] transition-all active:scale-95">
                     Search
                   </button>
-                  <select value={discoverProvider} onChange={(e) => { setDiscoverProvider(e.target.value); searchModpacks(discoverQuery, discoverSort, e.target.value); }} className="bg-[#F9FAFB] border border-gray-200 rounded-xl px-4 py-3.5 outline-none font-medium cursor-pointer"><option value="Modrinth">Modrinth</option><option value="CurseForge">CurseForge</option><option value="ATLauncher">ATLauncher</option><option value="Technic">Technic</option><option value="FTB">FeedTheBeast</option></select>
+                  <select value={discoverProvider} onChange={(e) => { setDiscoverProvider(e.target.value); searchModpacks(discoverQuery, discoverSort, e.target.value); }} className="bg-[#F9FAFB] border border-gray-200 rounded-xl px-4 py-3.5 outline-none font-medium cursor-pointer"><option value="Modrinth">Modrinth</option><option value="ATLauncher">ATLauncher</option><option value="Technic">Technic</option><option value="FTB">FeedTheBeast</option></select>
                 </div>
 
                 <div className="flex-1 overflow-y-auto pr-2 no-scrollbar">
                   {isSearching ? (
-                    <div className="flex items-center justify-center h-full text-gray-400 font-bold">Scraping APIs...</div>                    ) : modpacks.length === 0 ? (
-                      <div className="flex items-center justify-center h-full text-gray-400 font-bold">No modpacks found.</div>                  ) : (
+                    <div className="flex items-center justify-center h-full text-gray-400 font-bold">Scraping APIs...</div>
+                  ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                       {modpacks.map((pack) => (
                         <div key={pack.id} className="bg-[#F9FAFB] border border-gray-100 rounded-[20px] overflow-hidden hover:shadow-lg transition-all group flex flex-col">
                           <div className="h-32 w-full overflow-hidden bg-gray-200 relative">
-                               {pack.icon_url ? <img src={pack.icon_url} alt={pack.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 blur-sm opacity-50" onError={(e) => { e.currentTarget.src = `https://minotar.net/helm/${discoverProvider}/100.png` }} /> : null}
-                               {pack.icon_url ? <img src={pack.icon_url} alt={pack.title} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-xl shadow-lg group-hover:scale-110 transition-transform duration-500" onError={(e) => { e.currentTarget.src = `https://minotar.net/helm/${discoverProvider}/100.png` }} /> : null}
+                             {pack.icon_url ? <img src={pack.icon_url} alt={pack.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 blur-sm opacity-50" /> : null}
+                             {pack.icon_url ? <img src={pack.icon_url} alt={pack.title} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-xl shadow-lg group-hover:scale-110 transition-transform duration-500" /> : null}
                           </div>
                           <div className="p-5 flex-1 flex flex-col justify-between">
                             <div>
@@ -677,14 +639,5 @@ function App() {
 }
 
 export default App;
-
-
-
-
-
-
-
-
-
 
 

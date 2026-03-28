@@ -1,7 +1,7 @@
-use tauri::Manager;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 #[derive(Serialize, Deserialize)]
 struct InstanceMeta {
@@ -24,7 +24,10 @@ struct UIInstance {
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn get_instances(app_handle: tauri::AppHandle) -> Result<Vec<UIInstance>, String> {
-    let app_data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
     let instances_dir = app_data_dir.join("instances");
 
     if !instances_dir.exists() {
@@ -37,7 +40,7 @@ fn get_instances(app_handle: tauri::AppHandle) -> Result<Vec<UIInstance>, String
     for entry in fs::read_dir(instances_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        
+
         if path.is_dir() {
             let meta_path = path.join("instance.json");
             if meta_path.exists() {
@@ -70,7 +73,10 @@ fn get_instances(app_handle: tauri::AppHandle) -> Result<Vec<UIInstance>, String
 
 #[tauri::command]
 fn delete_instance(name: String, app_handle: tauri::AppHandle) -> Result<String, String> {
-    let app_data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
     let instance_dir = app_data_dir.join("instances").join(&name);
 
     if instance_dir.exists() {
@@ -82,15 +88,23 @@ fn delete_instance(name: String, app_handle: tauri::AppHandle) -> Result<String,
 }
 
 #[tauri::command]
-fn create_instance(name: String, version: String, mod_loader: String, app_handle: tauri::AppHandle) -> Result<String, String> {
+fn create_instance(
+    name: String,
+    version: String,
+    mod_loader: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
     // Validate name
     if name.trim().is_empty() {
         return Err("Instance name cannot be empty".to_string());
     }
 
     // Get the app's local data directory (in Windows: AppData/Roaming/com.tauri.dev or similar)
-    let app_data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-    
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+
     // Ensure the Critical launcher folder exists
     let instance_dir = app_data_dir.join("instances").join(&name);
 
@@ -116,12 +130,24 @@ fn create_instance(name: String, version: String, mod_loader: String, app_handle
     );
     fs::write(&meta_path, meta_content).map_err(|e| e.to_string())?;
 
-    Ok(format!("Successfully created '{}' at {:?}", name, instance_dir))
+    Ok(format!(
+        "Successfully created '{}' at {:?}",
+        name, instance_dir
+    ))
 }
 
 #[tauri::command]
-fn update_instance(old_name: String, new_name: String, version: String, mod_loader: String, app_handle: tauri::AppHandle) -> Result<String, String> {
-    let app_data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+fn update_instance(
+    old_name: String,
+    new_name: String,
+    version: String,
+    mod_loader: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
     let instances_dir = app_data_dir.join("instances");
     let old_dir = instances_dir.join(&old_name);
 
@@ -175,8 +201,15 @@ fn start_microsoft_oauth() -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_instances, create_instance, delete_instance, update_instance, start_microsoft_oauth])
+        .invoke_handler(tauri::generate_handler![
+            get_instances,
+            create_instance,
+            delete_instance,
+            update_instance,
+            start_microsoft_oauth
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
