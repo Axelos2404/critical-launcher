@@ -1,6 +1,10 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useMinecraftVersions } from "./hooks/useMinecraftVersions";
+import { useLoaderVersions } from "./hooks/useLoaderVersions";
+import { InstanceDetailView } from "./components/InstanceDetailView";
 import "./index.css";
 
 // Interface map matching our Rust UIInstance struct
@@ -9,7 +13,21 @@ interface InstanceData {
   name: string;
   version: string;
   type: string;
-  playTime: string;
+  loader_version: string | null;
+  play_time: string;
+}
+
+interface DeviceOAuthResponse {
+  user_code: string;
+  device_code: string;
+  verification_uri: string;
+  message: string;
+}
+
+interface MinecraftAccount {
+  mc_token: string;
+  uuid: string;
+  username: string;
 }
 
 function App() {
@@ -19,18 +37,49 @@ function App() {
   // Modals
   const [isNewModalOpen, setIsNewModalOpen] = useState(false);
   const [editingInstance, setEditingInstance] = useState<InstanceData | null>(null);
+  const [oauthData, setOauthData] = useState<DeviceOAuthResponse | null>(null);
+  const [oauthLoading, setOauthLoading] = useState(false);
+  const [mcAccount, setMcAccount] = useState<MinecraftAccount | null>(() => {
+    try {
+      const saved = localStorage.getItem("mc_account");
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
+  const [selectedInstance, setSelectedInstance] = useState<InstanceData | null>(null);
 
   // Form States
   const [instanceName, setInstanceName] = useState("");
   const [instanceVersion, setInstanceVersion] = useState("1.20.4");
   const [instanceLoader, setInstanceLoader] = useState("Vanilla");
+  const [instanceLoaderVersion, setInstanceLoaderVersion] = useState<string | null>(null);
+
+  // Dynamic version hooks (only active when modal is open)
+  const { versions: mcVersions, isLoading: versionsLoading, error: versionsError } = useMinecraftVersions();
+  const { loaderVersions, isLoading: loaderVersionsLoading } = useLoaderVersions(
+    isNewModalOpen ? instanceVersion : "",
+    isNewModalOpen ? instanceLoader : "Vanilla"
+  );
+
+  // Auto-select first loader version when list changes
+  useEffect(() => {
+    if (loaderVersions.length > 0) {
+      const stable = loaderVersions.find((v) => v.stable) ?? loaderVersions[0];
+      setInstanceLoaderVersion(stable.version);
+    } else {
+      setInstanceLoaderVersion(null);
+    }
+  }, [loaderVersions]);
 
   // Discover Fetch State
   const [discoverQuery, setDiscoverQuery] = useState("");
   const [discoverSort, setDiscoverSort] = useState("relevance");
   const [discoverProvider, setDiscoverProvider] = useState("Modrinth");
   const [modpacks, setModpacks] = useState<any[]>([]);
+  const [modpackError, setModpackError] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  // Infinite scroll state for CurseForge
+  const [cfPage, setCfPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
 
   // Settings State
   const [ramAllocation, setRamAllocation] = useState(4096);
@@ -43,7 +92,7 @@ function App() {
   const moddedInstances = instances.filter((i) => i.type !== "Vanilla");
 
   // Account State
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const isLoggedIn = mcAccount !== null;
 
   const refreshInstances = async () => {
     try {
@@ -80,6 +129,7 @@ function App() {
           newName: instanceName,
           version: instanceVersion,
           modLoader: instanceLoader,
+          loaderVersion: instanceLoaderVersion,
         });
       } else {
         // Create new
@@ -87,6 +137,7 @@ function App() {
           name: instanceName,
           version: instanceVersion,
           modLoader: instanceLoader,
+          loaderVersion: instanceLoaderVersion,
         });
       }
 
@@ -112,19 +163,57 @@ function App() {
 
   const startOAuth = async () => {
     try {
-      const response = await invoke<string>("start_microsoft_oauth");
-      alert(response + "\n(This is where we map out the real Microsoft token scraper pipeline)");
+      setOauthLoading(true);
+      const response = await invoke<DeviceOAuthResponse>("start_microsoft_oauth");
+      setOauthData(response);
+      setOauthLoading(false);
+
+      // Simple polling simulation for demonstration!
+      const pollInterval = setInterval(async () => {
+        try {
+          const tokenRes = await invoke<string>("poll_microsoft_oauth_token", { deviceCode: response.device_code });
+          // If we got here successfully without catch, it means it returned 200 OK!
+          if (tokenRes.includes("access_token")) {
+             clearInterval(pollInterval);
+             const tokenData = JSON.parse(tokenRes);
+             const msToken = tokenData.access_token;
+             try {
+               const mcRes = await invoke<MinecraftAccount>("login_to_minecraft", { msAccessToken: msToken });
+               setMcAccount(mcRes);
+               localStorage.setItem("mc_account", JSON.stringify(mcRes));
+               alert(`Successfully Authenticated with Minecraft! Welcome ${mcRes.username}`);
+             } catch (mcErr) {
+               console.error(mcErr);
+               alert("Minecraft Login Error: " + mcErr);
+             } finally {
+               setOauthData(null);
+             }
+          }
+        } catch (pollErr) {
+          // Will throw while pending (authorization_pending)
+          console.log("Polling...", pollErr);
+        }
+      }, 5000); // interval is usually 5s
+
     } catch (e) {
       console.error(e);
+      alert("OAuth Error: " + e);
+      setOauthLoading(false);
     }
   };
 
-  const searchModpacks = async (query: string, sort: string = discoverSort, provider: string = discoverProvider) => {
+  const searchModpacks = async (
+    query: string,
+    sort: string = discoverSort,
+    provider: string = discoverProvider,
+    page: number = 0,
+    append: boolean = false
+  ) => {
     setIsSearching(true);
     try {
       if (provider === "Modrinth") {
         const safeQuery = query.trim() ? query : "modpack";
-        const res = await fetch(`https://api.modrinth.com/v2/search?query=${safeQuery}&facets=[["project_type:modpack"]]&index=${sort}&limit=100`);
+        const res = await fetch(`https://api.modrinth.com/v2/search?query=${safeQuery}&facets=[[\"project_type:modpack\"]]&index=${sort}&limit=100`);
         const data = await res.json();
         setModpacks(data.hits.map((hit: any) => ({
           id: hit.project_id,
@@ -133,25 +222,35 @@ function App() {
           description: hit.description,
           icon_url: hit.icon_url || "https://minotar.net/helm/Modrinth/100.png",
         })));
+        setHasMore(false); // Modrinth: no infinite scroll implemented
       } else if (provider === "CurseForge") {
-          const safeQuery = query.trim() ? encodeURIComponent(query) : "";
-          const res = await tauriFetch(`https://api.curseforge.com/v1/mods/search?gameId=432&classId=4471&searchFilter=${safeQuery}&pageSize=50`, {
-            headers: { "x-api-key": import.meta.env.VITE_CURSEFORGE_API_KEY, "Accept": "application/json" }
-          });
-          if (!res.ok) {
-            const errorText = await res.text();
-            console.error(`CurseForge API rejected the key. Status: ${res.status}. Message: ${errorText}`);
-            setModpacks([]);
-            return;
-          }
-          const data = await res.json();
-          setModpacks((data.data || []).map((pack: any) => ({
-            id: pack.id.toString(),
-            title: pack.name,
-            author: pack.authors?.[0]?.name || "Unknown",
-            description: pack.summary || "A CurseForge modpack.",
-            icon_url: pack.logo?.url || "https://minotar.net/helm/CurseForge/100.png",
-          })));
+        const safeQuery = query.trim() ? encodeURIComponent(query) : "";
+        // Map your UI's sort string to CurseForge's specific sortField integers
+        let cfSortField = 2; // Default to Popularity (2)
+        if (sort === "downloads") cfSortField = 6; // Total Downloads (6)
+        else if (sort === "newest" || sort === "updated") cfSortField = 3; // Last Updated (3)
+        // Add index param for pagination
+        const url = `https://api.curseforge.com/v1/mods/search?gameId=432&classId=4471&searchFilter=${safeQuery}&pageSize=50&sortField=${cfSortField}&sortOrder=desc&index=${page * 50}`;
+        const res = await tauriFetch(url, {
+          headers: { "x-api-key": import.meta.env.VITE_CURSEFORGE_API_KEY, "Accept": "application/json" }
+        });
+        if (!res.ok) {
+          const errorText = await res.text();
+          console.error(`CurseForge API error. Status: ${res.status}. Message: ${errorText}`);
+          setModpacks([]);
+          setHasMore(false);
+          return;
+        }
+        const data = await res.json();
+        const newPacks = (data.data || []).map((pack: any) => ({
+          id: pack.id.toString(),
+          title: pack.name,
+          author: pack.authors?.[0]?.name || "Unknown",
+          description: pack.summary || "A CurseForge modpack.",
+          icon_url: pack.logo?.url || "https://minotar.net/helm/CurseForge/100.png",
+        }));
+        setHasMore(newPacks.length === 50);
+        setModpacks(prev => append ? [...prev, ...newPacks] : newPacks);
       } else if (provider === "ATLauncher") {
           const res = await fetch(`https://download.nodecdn.net/containers/atl/launcher/json/packsnew.json`);
           const data = await res.json();
@@ -218,6 +317,7 @@ function App() {
     } catch (e) {
       console.error(`${provider} fetch failed:`, e);
       setModpacks([]); // Clear on error
+      setModpackError(String(e));
     }
     setIsSearching(false);
   };
@@ -237,6 +337,7 @@ function App() {
     setInstanceName(instance.name);
     setInstanceVersion(instance.version);
     setInstanceLoader(instance.type);
+    setInstanceLoaderVersion(instance.loader_version);
     setIsNewModalOpen(true);
   };
 
@@ -245,9 +346,70 @@ function App() {
     setEditingInstance(null);
   };
 
+  // Infinite scroll: handle scroll event for discovery tab
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    if (
+      scrollHeight - scrollTop <= clientHeight + 100 &&
+      hasMore &&
+      !isSearching &&
+      discoverProvider === "CurseForge"
+    ) {
+      setCfPage(prev => prev + 1);
+    }
+  };
+
+  // Infinite scroll: fetch more when cfPage changes (but not on initial mount)
+  useEffect(() => {
+    if (cfPage > 0 && discoverProvider === "CurseForge") {
+      searchModpacks(discoverQuery, discoverSort, discoverProvider, cfPage, true);
+    }
+    // eslint-disable-next-line
+  }, [cfPage]);
+
+  // Reset page and hasMore on new search/provider/sort
+  useEffect(() => {
+    setCfPage(0);
+    setHasMore(true);
+    // Only fetch for CurseForge, others handled as before
+    if (activeCategory === "discover") {
+      searchModpacks(discoverQuery, discoverSort, discoverProvider, 0, false);
+    }
+    // eslint-disable-next-line
+  }, [discoverQuery, discoverSort, discoverProvider, activeCategory]);
+
   return (
     <div className="flex h-screen w-screen bg-[#F3F4F6] text-[#111827] font-sans overflow-hidden relative">
-      
+
+      {/* --- OAUTH MODAL --- */}
+      {oauthData && (
+        <div className="absolute inset-0 bg-[#111827]/20 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-white rounded-[24px] p-8 shadow-2xl w-full max-w-md border border-gray-100 transform transition-all text-center">
+            <h3 className="text-2xl font-bold mb-2">Microsoft Login</h3>
+            <p className="text-gray-500 text-sm mb-6 whitespace-pre-wrap">{oauthData.message}</p>
+            
+            <div className="bg-gray-100 rounded-xl p-4 mb-6">
+              <span className="text-sm text-gray-500 block mb-1">Your Code:</span>
+              <span className="text-3xl font-black tracking-widest text-[#111827] select-all cursor-pointer" onClick={() => {navigator.clipboard.writeText(oauthData.user_code); alert("Copied!")}}>{oauthData.user_code}</span>
+              <span className="text-xs text-blue-500 block mt-1">(Click to copy)</span>
+            </div>
+
+            <button 
+              onClick={() => openUrl(oauthData.verification_uri)}
+              className="w-full bg-[#111827] text-white py-3.5 rounded-xl font-bold shadow-md hover:bg-[#1F2937] transition-all mb-3"
+            >
+              Open Login Page
+            </button>
+            <button 
+              onClick={() => setOauthData(null)}
+              className="w-full bg-white border-2 border-gray-200 text-gray-700 py-3 rounded-xl font-bold hover:bg-gray-50 transition-all"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* --- CREATE / EDIT MODAL --- */}
       {isNewModalOpen && (
         <div className="absolute inset-0 bg-[#111827]/20 backdrop-blur-sm flex items-center justify-center z-50">
@@ -271,16 +433,20 @@ function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-1">Version</label>
+                  <label className="block text-sm font-semibold text-gray-700 mb-1 flex items-center gap-2">
+                    Version
+                    {versionsError && <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded-full font-bold">Fallback</span>}
+                  </label>
                   <select
                     value={instanceVersion}
                     onChange={(e) => setInstanceVersion(e.target.value)}
-                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 outline-none focus:border-[#111827] focus:ring-1 focus:ring-[#111827] transition-all appearance-none cursor-pointer"
+                    disabled={versionsLoading}
+                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 outline-none focus:border-[#111827] focus:ring-1 focus:ring-[#111827] transition-all appearance-none cursor-pointer disabled:opacity-50"
                   >
-                    <option value="1.20.4">1.20.4</option>
-                    <option value="1.20.1">1.20.1</option>
-                    <option value="1.19.4">1.19.4</option>
-                    <option value="1.12.2">1.12.2</option>
+                    {versionsLoading
+                      ? <option>Loading...</option>
+                      : mcVersions.map((v) => <option key={v.id} value={v.id}>{v.id}</option>)
+                    }
                   </select>
                 </div>
                 <div>
@@ -294,9 +460,29 @@ function App() {
                     <option value="Fabric">Fabric</option>
                     <option value="Forge">Forge</option>
                     <option value="Quilt">Quilt</option>
+                    <option value="NeoForge">NeoForge</option>
                   </select>
                 </div>
               </div>
+
+              {instanceLoader !== "Vanilla" && (
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-1">Loader Version</label>
+                  <select
+                    value={instanceLoaderVersion ?? ""}
+                    onChange={(e) => setInstanceLoaderVersion(e.target.value)}
+                    disabled={loaderVersionsLoading}
+                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 outline-none focus:border-[#111827] focus:ring-1 focus:ring-[#111827] transition-all appearance-none cursor-pointer disabled:opacity-50"
+                  >
+                    {loaderVersionsLoading
+                      ? <option>Loading {instanceLoader} versions...</option>
+                      : loaderVersions.length === 0
+                        ? <option value="">No versions found</option>
+                        : loaderVersions.map((v) => <option key={v.version} value={v.version}>{v.version}</option>)
+                    }
+                  </select>
+                </div>
+              )}
             </div>
 
             <div className="flex justify-end gap-3 mt-8">
@@ -308,7 +494,8 @@ function App() {
               </button>
               <button
                 onClick={handleSaveInstance}
-                className="bg-[#111827] hover:bg-[#1F2937] text-white px-6 py-2.5 rounded-xl font-semibold shadow-md active:scale-95 transition-all"
+                disabled={versionsLoading}
+                className="bg-[#111827] hover:bg-[#1F2937] text-white px-6 py-2.5 rounded-xl font-semibold shadow-md active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {editingInstance ? "Save Changes" : "Create"}
               </button>
@@ -413,17 +600,17 @@ function App() {
         </div>
 
         {/* Account System Button */}
-        <button onClick={startOAuth} className="flex items-center gap-3 bg-white p-3 rounded-2xl shadow-[0_2px_10px_-4px_rgba(0,0,0,0.1)] border border-gray-100 hover:shadow-md transition-all active:scale-95 text-left mb-2">
+        <button onClick={isLoggedIn ? () => { setMcAccount(null); localStorage.removeItem("mc_account"); } : startOAuth} className="flex items-center gap-3 bg-white p-3 rounded-2xl shadow-[0_2px_10px_-4px_rgba(0,0,0,0.1)] border border-gray-100 hover:shadow-md transition-all active:scale-95 text-left mb-2">
             <div className="w-10 h-10 rounded-full bg-gray-100 overflow-hidden shrink-0 border border-gray-200 flex items-center justify-center">
               {isLoggedIn ? (
-                 <img src="https://minotar.net/helm/Steve/40.png" alt="Skin" />
+                 <img src={`https://minotar.net/helm/${mcAccount?.uuid}/40.png`} alt="Skin" />
               ) : (
                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-gray-400"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
               )}
             </div>
             <div className="flex flex-col overflow-hidden">
-              <span className="text-sm font-bold truncate text-[#111827]">{isLoggedIn ? "PlayerName" : "Not Logged In"}</span>
-              <span className="text-xs text-gray-500 font-medium truncate">Click to authenticate</span>
+              <span className="text-sm font-bold truncate text-[#111827]">{isLoggedIn ? mcAccount?.username : "Not Logged In"}</span>
+              <span className="text-xs text-gray-500 font-medium truncate">{isLoggedIn ? "Click to log out" : "Click to authenticate"}</span>
             </div>
         </button>
       </div>
@@ -452,13 +639,18 @@ function App() {
             {activeCategory === "product" && activeSubTab === "overview" && (
               <div className="flex gap-6 h-full">
                 <div className="flex-1 flex flex-col gap-6">
-                  {/* Instances List (Reused below too, abstracting logic mapping) */}
+                  {selectedInstance ? (
+                    <InstanceDetailView
+                      instance={selectedInstance}
+                      onBack={() => setSelectedInstance(null)}
+                    />
+                  ) : (
                   <div className="bg-[#F9FAFB] rounded-[24px] p-6 border border-gray-100 flex-1 flex flex-col">
                     <h3 className="font-bold text-lg mb-6">All Instances</h3>
                     <div className="flex flex-col gap-3">
                       {instances.length === 0 && <p className="text-gray-400 text-sm">No instances found.</p>}
                       {instances.map((instance) => (
-                        <div key={instance.id} className="bg-white border border-gray-100 rounded-xl p-4 flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer group">
+                        <div key={instance.id} onClick={() => setSelectedInstance(instance)} className="bg-white border border-gray-100 rounded-xl p-4 flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer group">
                           <div className="flex items-center gap-4">
                             <div className="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center font-bold text-gray-400 group-hover:bg-[#111827] group-hover:text-white transition-colors">
                               MC
@@ -469,7 +661,7 @@ function App() {
                             </div>
                           </div>
                           <div className="flex items-center gap-4">
-                            <span className="text-sm font-semibold text-gray-600 w-12 text-right">{instance.playTime}</span>
+                            <span className="text-sm font-semibold text-gray-600 w-12 text-right">{instance.play_time}</span>
                             
                             <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                               <button
@@ -498,8 +690,10 @@ function App() {
                       ))}
                     </div>
                   </div>
+                  )} {/* end selectedInstance ternary */}
                 </div>
 
+                {!selectedInstance && (
                 <div className="w-80 shrink-0 bg-[#F9FAFB] rounded-[24px] p-6 border border-gray-100 flex flex-col">
                   <h3 className="font-bold text-lg mb-6">Launcher Timeline</h3>
                   <div className="relative border-l-2 border-gray-200 ml-3 pl-5 flex flex-col gap-6 mt-2">
@@ -511,6 +705,7 @@ function App() {
                     </div>
                   </div>
                 </div>
+                )} {/* end !selectedInstance timeline */}
               </div>
             )}
 
@@ -521,7 +716,7 @@ function App() {
                 <div className="flex flex-col gap-3 overflow-y-auto pr-2 no-scrollbar">
                   {(activeSubTab === "vanilla" ? vanillaInstances : moddedInstances).length > 0 ? (
                     (activeSubTab === "vanilla" ? vanillaInstances : moddedInstances).map((instance) => (
-                      <div key={instance.id} className="bg-white border border-gray-100 rounded-xl p-4 flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer group">
+                      <div key={instance.id} onClick={() => setSelectedInstance(instance)} className="bg-white border border-gray-100 rounded-xl p-4 flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer group">
                         <div className="flex items-center gap-4">
                           <div className="w-14 h-14 bg-gray-100 rounded-lg flex items-center justify-center font-bold text-gray-400 group-hover:bg-[#111827] group-hover:text-white transition-colors">MC</div>
                           <div>
@@ -530,7 +725,7 @@ function App() {
                           </div>
                         </div>
                         <div className="flex items-center gap-6">
-                            <span className="text-sm font-semibold text-gray-600 w-12 text-right">{instance.playTime}</span>
+                            <span className="text-sm font-semibold text-gray-600 w-12 text-right">{instance.play_time}</span>
                             
                             <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                               <button onClick={(e) => openEditModal(instance, e)} className="w-12 h-12 rounded-full flex items-center justify-center bg-gray-50 text-blue-500 hover:bg-blue-500 hover:text-white transition-colors" ><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path></svg></button>
@@ -640,10 +835,11 @@ function App() {
                   <select value={discoverProvider} onChange={(e) => { setDiscoverProvider(e.target.value); searchModpacks(discoverQuery, discoverSort, e.target.value); }} className="bg-[#F9FAFB] border border-gray-200 rounded-xl px-4 py-3.5 outline-none font-medium cursor-pointer"><option value="Modrinth">Modrinth</option><option value="CurseForge">CurseForge</option><option value="ATLauncher">ATLauncher</option><option value="Technic">Technic</option><option value="FTB">FeedTheBeast</option></select>
                 </div>
 
-                <div className="flex-1 overflow-y-auto pr-2 no-scrollbar">
-                  {isSearching ? (
-                    <div className="flex items-center justify-center h-full text-gray-400 font-bold">Scraping APIs...</div>                    ) : modpacks.length === 0 ? (
-                      <div className="flex items-center justify-center h-full text-gray-400 font-bold">No modpacks found.</div>                  ) : (
+                <div className="flex-1 overflow-y-auto pr-2 no-scrollbar" onScroll={handleScroll}>
+                  {modpackError && (
+                    <div className="text-red-500 font-bold mb-4">{modpackError}</div>
+                  )}
+                  {modpacks.length > 0 ? (
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                       {modpacks.map((pack) => (
                         <div key={pack.id} className="bg-[#F9FAFB] border border-gray-100 rounded-[20px] overflow-hidden hover:shadow-lg transition-all group flex flex-col">
@@ -664,6 +860,8 @@ function App() {
                         </div>
                       ))}
                     </div>
+                  ) : (
+                    <div className="flex items-center justify-center h-full text-gray-400 font-bold">No modpacks found.</div>
                   )}
                 </div>
               </div>

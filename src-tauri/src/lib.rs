@@ -1,13 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
 use tauri::Manager;
+use serde_json::json;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MinecraftAccount {
+    pub mc_token: String,
+    pub uuid: String,
+    pub username: String,
+}
 
 #[derive(Serialize, Deserialize)]
 struct InstanceMeta {
     name: String,
     version: String,
     mod_loader: String,
+    #[serde(default)]
+    loader_version: Option<String>,
     play_time_minutes: u64,
 }
 
@@ -18,7 +27,14 @@ struct UIInstance {
     version: String,
     #[serde(rename = "type")]
     loader_type: String,
-    playTime: String,
+    loader_version: Option<String>,
+    play_time: String,
+}
+
+#[derive(Serialize)]
+struct ModFile {
+    filename: String,
+    size_bytes: u64,
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -60,7 +76,8 @@ fn get_instances(app_handle: tauri::AppHandle) -> Result<Vec<UIInstance>, String
                         name: meta.name,
                         version: meta.version,
                         loader_type: meta.mod_loader,
-                        playTime: play_time_str,
+                        loader_version: meta.loader_version,
+                        play_time: play_time_str,
                     });
                     id_counter += 1;
                 }
@@ -92,6 +109,7 @@ fn create_instance(
     name: String,
     version: String,
     mod_loader: String,
+    loader_version: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     // Validate name
@@ -99,41 +117,39 @@ fn create_instance(
         return Err("Instance name cannot be empty".to_string());
     }
 
-    // Get the app's local data directory (in Windows: AppData/Roaming/com.tauri.dev or similar)
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?;
 
-    // Ensure the Critical launcher folder exists
     let instance_dir = app_data_dir.join("instances").join(&name);
 
     if instance_dir.exists() {
         return Err("An instance with this name already exists!".to_string());
     }
 
-    // Create the instance core directories
     fs::create_dir_all(instance_dir.join(".minecraft")).map_err(|e| e.to_string())?;
     fs::create_dir_all(instance_dir.join("mods")).map_err(|e| e.to_string())?;
     fs::create_dir_all(instance_dir.join("resourcepacks")).map_err(|e| e.to_string())?;
 
-    // Create an instance.json metadata file
     let meta_path = instance_dir.join("instance.json");
+    let loader_version_json = match &loader_version {
+        Some(v) => format!(r#""{}""#, v),
+        None => "null".to_string(),
+    };
     let meta_content = format!(
         r#"{{
   "name": "{}",
   "version": "{}",
   "mod_loader": "{}",
+  "loader_version": {},
   "play_time_minutes": 0
 }}"#,
-        name, version, mod_loader
+        name, version, mod_loader, loader_version_json
     );
     fs::write(&meta_path, meta_content).map_err(|e| e.to_string())?;
 
-    Ok(format!(
-        "Successfully created '{}' at {:?}",
-        name, instance_dir
-    ))
+    Ok(format!("Successfully created '{}' at {:?}", name, instance_dir))
 }
 
 #[tauri::command]
@@ -142,6 +158,7 @@ fn update_instance(
     new_name: String,
     version: String,
     mod_loader: String,
+    loader_version: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     let app_data_dir = app_handle
@@ -176,29 +193,256 @@ fn update_instance(
         }
     }
 
+    let loader_version_json = match &loader_version {
+        Some(v) => format!(r#""{}""#, v),
+        None => "null".to_string(),
+    };
     let meta_content = format!(
         r#"{{
   "name": "{}",
   "version": "{}",
   "mod_loader": "{}",
+  "loader_version": {},
   "play_time_minutes": {}
 }}"#,
-        new_name, version, mod_loader, play_time
+        new_name, version, mod_loader, loader_version_json, play_time
     );
     fs::write(&meta_path, meta_content).map_err(|e| e.to_string())?;
 
     Ok("Instance updated".to_string())
 }
 
-#[tauri::command]
-fn start_microsoft_oauth() -> Result<String, String> {
-    // This is a placeholder for the actual complex OAuth flow
-    // which involves opening a browser to login.live.com, capturing the token,
-    // exchanging it for XSTS, and doing Minecraft auth.
-    Ok("Please implement Azure App Client ID first to run OAuth!".to_string())
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DeviceOAuthResponse {
+    pub user_code: String,
+    pub device_code: String,
+    pub verification_uri: String,
+    pub message: String,
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+const CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb"; // Prism/Third-party standard client ID
+
+#[tauri::command]
+async fn start_microsoft_oauth() -> Result<DeviceOAuthResponse, String> {
+    let client = reqwest::Client::new();
+
+    let params_azure = [
+        ("client_id", CLIENT_ID),
+        ("scope", "XboxLive.signin offline_access"),
+    ];
+
+    let res = client
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+        .form(&params_azure)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if res.status().is_success() {
+        let auth_resp: DeviceOAuthResponse = res.json().await.map_err(|e| format!("Parse error: {}", e))?;
+        Ok(auth_resp)
+    } else {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        Err(format!("Error HTTP {}: {}", status, body))
+    }
+}
+
+#[tauri::command]
+async fn poll_microsoft_oauth_token(device_code: String) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let params = [
+        ("client_id", CLIENT_ID),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", &device_code),
+    ];
+
+    let res = client
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        Ok(text)
+    } else {
+        Err(format!("Pending or Error: {}", res.status()))
+    }
+}
+
+#[tauri::command]
+async fn login_to_minecraft(ms_access_token: String) -> Result<MinecraftAccount, String> {
+    let client = reqwest::Client::new();
+
+    // 1. Authenticate with Xbox Live
+    let xbl_req = json!({
+        "Properties": {
+            "AuthMethod": "RPS",
+            "SiteName": "user.auth.xboxlive.com",
+            "RpsTicket": format!("d={}", ms_access_token)
+        },
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT"
+    });
+
+    let xbl_res_call = client.post("https://user.auth.xboxlive.com/user/authenticate")
+        .json(&xbl_req)
+        .send().await.map_err(|e| format!("XBL Error: {}", e))?;
+    
+    let xbl_res: serde_json::Value = xbl_res_call.json().await.map_err(|e| format!("XBL Parse: {}", e))?;
+    let xbl_token = xbl_res["Token"].as_str().ok_or("Failed to extract XBL Token")?;
+    let user_hash = xbl_res["DisplayClaims"]["xui"][0]["uhs"].as_str().ok_or("Failed to extract XBL uhs")?;
+
+    // 2. Authenticate with XSTS
+    let xsts_req = json!({
+        "Properties": {
+            "SandboxId": "RETAIL",
+            "UserTokens": [xbl_token]
+        },
+        "RelyingParty": "rp://api.minecraftservices.com/",
+        "TokenType": "JWT"
+    });
+
+    let xsts_res_call = client.post("https://xsts.auth.xboxlive.com/xsts/authorize")
+        .json(&xsts_req)
+        .send().await.map_err(|e| format!("XSTS Error: {}", e))?;
+
+    if !xsts_res_call.status().is_success() {
+        return Err("XSTS authentication failed. Account might not have an Xbox profile or may be a child account.".to_string());
+    }
+
+    let xsts_res: serde_json::Value = xsts_res_call.json().await.map_err(|e| format!("XSTS Parse: {}", e))?;
+    let xsts_token = xsts_res["Token"].as_str().ok_or("Failed to extract XSTS Token")?;
+
+    // 3. Authenticate with Minecraft using XSTS
+    let mc_req = json!({
+        "identityToken": format!("XBL3.0 x={};{}", user_hash, xsts_token)
+    });
+
+    let mc_res_call = client.post("https://api.minecraftservices.com/authentication/login_with_xbox")
+        .json(&mc_req)
+        .send().await.map_err(|e| format!("MC Auth Error: {}", e))?;
+    
+    let mc_res: serde_json::Value = mc_res_call.json().await.map_err(|e| format!("MC Auth Parse: {}", e))?;
+    let mc_token = mc_res["access_token"].as_str().ok_or("Failed to extract MC Access Token")?;
+
+    // 4. Fetch Minecraft Profile 
+    let profile_res_call = client.get("https://api.minecraftservices.com/minecraft/profile")
+        .bearer_auth(mc_token)
+        .send().await.map_err(|e| format!("Profile Auth Error: {}", e))?;
+
+    let profile_res: serde_json::Value = profile_res_call.json().await.map_err(|e| format!("Profile Parse Error: {}", e))?;
+
+    if let Some(err) = profile_res["error"].as_str() {
+        return Err(format!("Minecraft Profile Error: You may not own the game on this account. ({})", err));
+    }
+
+    let uuid = profile_res["id"].as_str().ok_or("No Minecraft profile found!")?;
+    let username = profile_res["name"].as_str().unwrap_or("Player");
+
+    Ok(MinecraftAccount {
+        mc_token: mc_token.to_string(),
+        uuid: uuid.to_string(),
+        username: username.to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_instance_mods(name: String, app_handle: tauri::AppHandle) -> Result<Vec<ModFile>, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    let mods_dir = app_data_dir.join("instances").join(&name).join("mods");
+
+    if !mods_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut mods = Vec::new();
+    for entry in fs::read_dir(&mods_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            mods.push(ModFile { filename, size_bytes });
+        }
+    }
+
+    Ok(mods)
+}
+
+#[tauri::command]
+async fn download_mod(
+    instance_name: String,
+    mod_url: String,
+    filename: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    let mods_dir = app_data_dir.join("instances").join(&instance_name).join("mods");
+
+    if !mods_dir.exists() {
+        fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&mod_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status: {}", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response bytes: {}", e))?;
+
+    let dest_path = mods_dir.join(&filename);
+    fs::write(&dest_path, &bytes).map_err(|e| format!("Failed to write mod file: {}", e))?;
+
+    Ok(format!("Downloaded '{}' to {:?}", filename, dest_path))
+}
+
+#[tauri::command]
+fn remove_mod(
+    instance_name: String,
+    filename: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    let mod_path = app_data_dir
+        .join("instances")
+        .join(&instance_name)
+        .join("mods")
+        .join(&filename);
+
+    if !mod_path.exists() {
+        return Err(format!("Mod file '{}' not found", filename));
+    }
+
+    fs::remove_file(&mod_path).map_err(|e| format!("Failed to remove mod: {}", e))?;
+    Ok(format!("Removed '{}'", filename))
+}
+
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
@@ -208,7 +452,12 @@ pub fn run() {
             create_instance,
             delete_instance,
             update_instance,
-            start_microsoft_oauth
+            start_microsoft_oauth,
+            poll_microsoft_oauth_token,
+            login_to_minecraft,
+            get_instance_mods,
+            download_mod,
+            remove_mod
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -23,4 +23,6 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-http = "2"
+reqwest = { version = "0.13.2", features = ["form", "json"] }
+tokio = "1.50.0"
 
